@@ -1,6 +1,12 @@
 import createHttpError from 'http-errors';
 import { MigrationClient } from './migration-client';
 import { Cacheable } from 'typescript-cacheable';
+import {
+  getRetryConfig,
+  isRetryableStatus,
+  isRetryableTransportError,
+  sleepWithJitter,
+} from './extension-client-retry';
 
 export const NO_ID_MAP_MESSAGE = 'No id map found';
 
@@ -19,9 +25,9 @@ export abstract class ExtensionClient {
     options: RequestInit = {},
   ): Promise<T> {
     const { url, token } = await this.getUrlAndToken();
-    const response = await (
-      await this.getFetch()
-    )(`${url}${this.extensionUri}${uri}`, {
+    const doFetch = await this.getFetch();
+    const fullUrl = `${url}${this.extensionUri}${uri}`;
+    const fetchOpts: RequestInit = {
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -30,12 +36,40 @@ export abstract class ExtensionClient {
       method,
       body: payload ? JSON.stringify(payload) : null,
       ...options,
-    });
-    if (!response.ok) {
+    };
+
+    const { max, baseMs } = getRetryConfig();
+    const methodName = (method ?? 'GET').toUpperCase();
+
+    for (let attempt = 0; attempt <= max; attempt++) {
+      let response: Response;
+      try {
+        response = await doFetch(fullUrl, fetchOpts);
+      } catch (err) {
+        if (attempt < max && isRetryableTransportError(err)) {
+          await sleepWithJitter(baseMs, attempt + 1);
+          continue;
+        }
+        throw err;
+      }
+
+      if (response.ok) {
+        try {
+          return (await response.json()) as T;
+        } catch {
+          return (await response.text()) as T;
+        }
+      }
+
+      if (attempt < max && isRetryableStatus(response.status, methodName)) {
+        await sleepWithJitter(baseMs, attempt + 1);
+        continue;
+      }
+
       let error;
       try {
-        const payload: Error = await response.json();
-        error = createHttpError(response.status, payload.message);
+        const errPayload: Error = await response.json();
+        error = createHttpError(response.status, errPayload.message);
       } catch (e) {
         if (response.status === 404 && response.statusText === 'Not Found') {
           error = createHttpError(
@@ -47,13 +81,10 @@ export abstract class ExtensionClient {
         }
       }
       throw error;
-    } else {
-      try {
-        return (await response.json()) as T;
-      } catch {
-        return (await response.text()) as T;
-      }
     }
+
+    // Defensive: loop always returns or throws.
+    throw createHttpError(503, 'extension-client retry loop exhausted');
   }
 
   @Cacheable()
